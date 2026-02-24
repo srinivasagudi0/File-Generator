@@ -28,7 +28,7 @@ try:
     from openai import OpenAI
 except ImportError:
     OpenAI = None
-    logger.warning('openai package not installed; HackClub AI features unavailable')
+    logger.warning('openai package not installed; AI features unavailable')
 
 try:
     import requests
@@ -48,7 +48,7 @@ IMAGE_MIME_BY_EXT = {
 }
 IMAGE_GENERATION_SIZES = {'1024x1024', '1024x1792', '1792x1024'}
 IMAGE_EDIT_SIZES = {'256x256', '512x512', '1024x1024'}
-SUPPORTED_AI_PROVIDERS = {'hackclub'}
+SUPPORTED_AI_PROVIDERS = {'openai', 'hackclub'}
 SUPPORTED_AI_PROVIDER_ALIASES = {'hackvcl': 'hackclub'}
 
 
@@ -107,20 +107,28 @@ def _env_any(*names: str) -> str:
 
 
 def _detect_ai_provider() -> str:
-    # Always prefer HackClub; fallback only if explicit alias is provided.
     configured = _env('FILEGEN_AI_PROVIDER').lower()
     if configured in SUPPORTED_AI_PROVIDER_ALIASES:
         return SUPPORTED_AI_PROVIDER_ALIASES[configured]
-    return 'hackclub'
+    if configured in SUPPORTED_AI_PROVIDERS:
+        return configured
+    if _env('OPENAI_API_KEY'):
+        return 'openai'
+    if _env_any('HACKCLUB_API_KEY', 'HACKVCL_API_KEY'):
+        return 'hackclub'
+    return 'openai'
 
 
 def _pick_model(
     provider: str,
     provider_keys: tuple[str, ...],
+    openai_keys: tuple[str, ...],
     fallback_keys: tuple[str, ...],
     default: str,
 ) -> str:
-    return _env_any(*provider_keys) or _env_any(*fallback_keys) or default
+    if provider == 'hackclub':
+        return _env_any(*provider_keys) or _env_any(*fallback_keys) or default
+    return _env_any(*openai_keys) or _env_any(*fallback_keys) or default
 
 
 def _is_provider_configured(provider: str) -> bool:
@@ -129,12 +137,18 @@ def _is_provider_configured(provider: str) -> bool:
         has_key = bool(_env_any('HACKCLUB_API_KEY', 'HACKVCL_API_KEY'))
         has_base_url = bool(_env_any('HACKCLUB_BASE_URL', 'HACKVCL_BASE_URL'))
         return has_key and has_base_url
+    if provider == 'openai':
+        return bool(_env('OPENAI_API_KEY'))
     return False
 
 
 def _provider_retry_order() -> tuple[str, ...]:
-    # Single-provider pipeline: HackClub only.
-    return ('hackclub',)
+    preferred = _detect_ai_provider()
+    order: list[str] = [preferred]
+    alternate = 'openai' if preferred == 'hackclub' else 'hackclub'
+    if _is_provider_configured(alternate):
+        order.append(alternate)
+    return tuple(order)
 
 
 def _load_ai_settings_for_provider(provider: str) -> dict[str, str]:
@@ -144,12 +158,18 @@ def _load_ai_settings_for_provider(provider: str) -> dict[str, str]:
     if provider not in SUPPORTED_AI_PROVIDERS:
         raise RuntimeError(f'Unsupported AI provider: {provider}')
 
-    api_key = _env_any('HACKCLUB_API_KEY', 'HACKVCL_API_KEY')
-    if not api_key:
-        raise RuntimeError('HACKCLUB_API_KEY is not set.')
-    base_url = _env_any('HACKCLUB_BASE_URL', 'HACKVCL_BASE_URL')
-    if not base_url:
-        raise RuntimeError('HACKCLUB_BASE_URL is not set.')
+    if provider == 'hackclub':
+        api_key = _env_any('HACKCLUB_API_KEY', 'HACKVCL_API_KEY')
+        if not api_key:
+            raise RuntimeError('HACKCLUB_API_KEY is not set.')
+        base_url = _env_any('HACKCLUB_BASE_URL', 'HACKVCL_BASE_URL')
+        if not base_url:
+            raise RuntimeError('HACKCLUB_BASE_URL is not set.')
+    else:
+        api_key = _env('OPENAI_API_KEY')
+        if not api_key:
+            raise RuntimeError('OPENAI_API_KEY is not set.')
+        base_url = _env('OPENAI_BASE_URL')
 
     return {
         'provider': provider,
@@ -158,24 +178,28 @@ def _load_ai_settings_for_provider(provider: str) -> dict[str, str]:
         'chat_model': _pick_model(
             provider,
             ('HACKCLUB_CHAT_MODEL', 'HACKVCL_CHAT_MODEL'),
+            ('OPENAI_CHAT_MODEL',),
             ('FILEGEN_CHAT_MODEL',),
             'gpt-3.5-turbo',
         ),
         'vision_model': _pick_model(
             provider,
             ('HACKCLUB_VISION_MODEL', 'HACKVCL_VISION_MODEL'),
+            ('OPENAI_VISION_MODEL',),
             ('FILEGEN_VISION_MODEL',),
             'gpt-4o-mini',
         ),
         'image_generation_model': _pick_model(
             provider,
             ('HACKCLUB_IMAGE_GENERATION_MODEL', 'HACKVCL_IMAGE_GENERATION_MODEL'),
+            ('OPENAI_IMAGE_GENERATION_MODEL',),
             ('FILEGEN_IMAGE_GENERATION_MODEL',),
             'dall-e-3',
         ),
         'image_edit_models': _pick_model(
             provider,
             ('HACKCLUB_IMAGE_EDIT_MODELS', 'HACKVCL_IMAGE_EDIT_MODELS'),
+            ('OPENAI_IMAGE_EDIT_MODELS',),
             ('FILEGEN_IMAGE_EDIT_MODELS',),
             'dall-e-2',
         ),

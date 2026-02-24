@@ -232,7 +232,7 @@ def run_action(
         if isinstance(payload, str) and payload.lstrip().lower().startswith('[ai unavailable'):
             return payload
         if action in ('W', 'A') and content.strip() and not str(payload).strip():
-            return 'AI returned empty content. Please check your HackClub API settings and try again.'
+            return 'AI returned empty content. Please check your AI API settings and try again.'
     else:
         payload = content
     result = agent(payload, file_name, action, style, format_options=format_options, details=detail_items)
@@ -278,7 +278,7 @@ def _render_preview(path: Path, file_type: str) -> None:
             return
         lowered_text = text.lstrip().lower()
         if lowered_text.startswith('[ai unavailable') or lowered_text.startswith('error: ai unavailable'):
-            st.error('AI generation failed for this draft. Update your HackClub API settings and generate a new preview.')
+            st.error('AI generation failed for this draft. Update your AI API settings and generate a new preview.')
         st.text_area('File Preview', value=text, height=320, disabled=True)
         return
 
@@ -393,7 +393,7 @@ def _render_sidebar_help() -> None:
     with st.sidebar.expander('Input Examples', expanded=False):
         st.markdown('Chart: `line|Jan:10,Feb:20,Mar:15`')
         st.markdown('Table detail: `tables: Name|Q1|Q2`')
-        st.markdown('Hyperlink detail: `hyperlinks: Hack Club|https://hackclub.com`')
+        st.markdown('Hyperlink detail: `hyperlinks: Example Site|https://example.com`')
 
 
 def build_ui() -> None:
@@ -487,7 +487,7 @@ def build_ui() -> None:
                 details_raw = st.text_area(
                     'Details (one per line: category: value)',
                     height=170,
-                    placeholder='tables: Name|Q1|Q2 / A|10|20\nhyperlinks: Hack Club|https://hackclub.com\nheaders: Project Falcon - Status',
+                    placeholder='tables: Name|Q1|Q2 / A|10|20\nhyperlinks: Example Site|https://example.com\nheaders: Project Falcon - Status',
                 )
                 st.caption(
                     'Supported keywords: images, tables, charts, hyperlinks, fonts, colors, margins, headers, '

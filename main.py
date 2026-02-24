@@ -256,7 +256,7 @@ def ask_generation_details() -> list[tuple[str, str]]:
     print('- tables: Name|Q1|Q2 / A|12|16 / B|10|14')
     print('- charts: line|Jan:10,Feb:12,Mar:9')
     print('- images: path:./assets/logo.png or prompt:a blue abstract banner')
-    print('- hyperlinks: Hack Club|https://hackclub.com')
+    print('- hyperlinks: Example Site|https://example.com')
     print(f'Supported categories: {", ".join(SUPPORTED_DETAIL_CATEGORIES)}')
     items: list[tuple[str, str]] = []
     seen: set[tuple[str, str]] = set()

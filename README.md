@@ -5,7 +5,7 @@ It includes:
 
 - CLI workflow (`main.py`)
 - Streamlit UI workflow (`app_ui.py`)
-- AI-assisted content generation and summarization (HackClub API only, configured via `.env`)
+- AI-assisted content generation and summarization (OpenAI by default, HackClub optional, configured via `.env`)
 
 ## Supported File Types
 
@@ -27,12 +27,21 @@ pip install -r requirements.txt
 cp .env.example .env
 ```
 
-Set your HackClub API config in `.env` before running:
+Set your API config in `.env` before running.
+
+OpenAI (default / easiest setup):
 
 ```env
-FILEGEN_AI_PROVIDER=hackclub  # optional; defaults to hackclub
+FILEGEN_AI_PROVIDER=openai
+OPENAI_API_KEY=your-openai-api-key
+```
+
+Optional HackClub configuration:
+
+```env
+FILEGEN_AI_PROVIDER=hackclub
 HACKCLUB_API_KEY=your-hackclub-api-key
-HACKCLUB_BASE_URL=https://your-hackclub-base-url/v1
+HACKCLUB_BASE_URL=https://ai.hackclub.com/proxy/v1
 ```
 
 ## Run
