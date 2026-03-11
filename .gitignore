@@ -122,6 +122,7 @@ cython_debug/
 
 # Project-generated artifacts
 .ui_previews/
+.filegen_data/
 processed_images/
 cloud_storage/
 

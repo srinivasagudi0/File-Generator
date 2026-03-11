@@ -3,10 +3,21 @@ from __future__ import annotations
 import mimetypes
 import re
 from pathlib import Path
-from uuid import uuid4
 
 import streamlit as st
 
+from auth_store import (
+    allocate_storage_path,
+    authenticate_user,
+    create_file_record,
+    create_user,
+    get_file_record,
+    is_user_storage_path,
+    list_file_records,
+    mark_file_deleted,
+    sanitize_file_name,
+    update_file_record,
+)
 from file_generator import agent
 from intel import process_input as process
 
@@ -38,6 +49,7 @@ SUPPORTED_FILE_TYPES = [
 ]
 CREATE_ACTION_LABELS = {'Write': 'W', 'Append': 'A'}
 READ_DELETE_ACTION_LABELS = {'Read': 'R', 'Delete': 'D'}
+DELETE_FILE_ALIASES = {'', 'file', 'entire file', 'full file', 'whole file', 'delete file', 'remove file'}
 FILE_TYPE_HINTS = {
     'txt': 'Summaries, instructions, quick notes, or templates.',
     'docx': 'Reports, briefs, meeting notes with headings and bullet lists.',
@@ -61,7 +73,6 @@ SUPPORTED_DETAIL_CATEGORIES = (
     'page_numbers', 'tables_of_contents', 'indexes', 'bibliographies',
     'citations', 'footnotes', 'notes',
 )
-DRAFT_DIR = Path('.ui_previews')
 
 
 def parse_chart_data(raw_data: str) -> tuple[dict[str, float], str]:
@@ -118,9 +129,8 @@ def _validate_generation_inputs(
     content: str,
     chart_type: str,
     chart_data_raw: str,
-    append_target: str,
+    has_append_target: bool,
 ) -> tuple[list[str], list[str]]:
-    """Return (errors, warnings) for the creation flow."""
     errors: list[str] = []
     warnings: list[str] = []
 
@@ -134,17 +144,13 @@ def _validate_generation_inputs(
         if not chart_type:
             errors.append('Choose a chart type.')
 
-    if create_action == 'A' and append_target.strip():
-        target = append_target.strip()
-        target_path = Path(target if '.' in Path(target).name else resolve_file_name(target, file_type))
-        if not target_path.exists():
-            warnings.append(f'Append target "{target_path.name}" was not found. A new draft will be created instead.')
+    if create_action == 'A' and not has_append_target:
+        warnings.append('No existing private file selected. Append will create a new file in your workspace.')
 
     return errors, warnings
 
 
 def _show_step_feedback(errors: list[str], warnings: list[str], ready_text: str) -> None:
-    """Render inline feedback for the current step."""
     if errors:
         bullets = '\n'.join(f'- {msg}' for msg in errors)
         st.error(f'Please fix these before continuing:\n{bullets}')
@@ -240,6 +246,8 @@ def run_action(
 
 
 def _init_state() -> None:
+    if 'auth_user' not in st.session_state:
+        st.session_state.auth_user = None
     if 'draft' not in st.session_state:
         st.session_state.draft = None
     if 'feedback_text' not in st.session_state:
@@ -248,10 +256,15 @@ def _init_state() -> None:
         st.session_state.feedback_history = []
 
 
-def _new_draft_path(file_type: str) -> str:
-    DRAFT_DIR.mkdir(parents=True, exist_ok=True)
-    ext = DEFAULT_EXT_BY_TYPE[file_type]
-    return str((DRAFT_DIR / f'draft_{uuid4().hex}.{ext}').resolve())
+def _clear_draft_state() -> None:
+    st.session_state.draft = None
+    st.session_state.feedback_text = ''
+    st.session_state.feedback_history = []
+
+
+def _clear_user_session() -> None:
+    st.session_state.auth_user = None
+    _clear_draft_state()
 
 
 def _guess_mime(path: Path) -> str:
@@ -261,9 +274,9 @@ def _guess_mime(path: Path) -> str:
     return 'application/octet-stream'
 
 
-def _render_preview(path: Path, file_type: str) -> None:
+def _render_preview(path: Path, file_type: str, label: str) -> None:
     st.subheader('Preview')
-    st.caption(f'Draft file: `{path}`')
+    st.caption(f'File: `{label}`')
     ext = path.suffix.lower().lstrip('.')
 
     if ext in IMAGE_EXTENSIONS:
@@ -308,40 +321,153 @@ def _parse_chart_feedback(feedback: str, default_type: str) -> tuple[str, str, s
     return '', '', 'For chart updates, use format like "line|Jan:10,Feb:20".'
 
 
+def _is_error_text(value: object) -> bool:
+    if not isinstance(value, str):
+        return False
+    lowered = value.lower()
+    return (
+        lowered.startswith('error')
+        or lowered.startswith('[ai unavailable')
+        or 'ai unavailable' in lowered
+        or 'missing dependency' in lowered
+        or 'unsupported file type' in lowered
+        or 'invalid action' in lowered
+        or 'not found' in lowered
+        or 'ai returned empty content' in lowered
+    )
+
+
+def _is_full_delete_request(value: str) -> bool:
+    return str(value or '').strip().lower() in DELETE_FILE_ALIASES
+
+
+def _record_exists(record: dict[str, object]) -> bool:
+    return Path(str(record['storage_path'])).exists()
+
+
+def _active_records(records: list[dict[str, object]]) -> list[dict[str, object]]:
+    return [record for record in records if record['status'] == 'active']
+
+
+def _existing_active_records(records: list[dict[str, object]]) -> list[dict[str, object]]:
+    return [record for record in _active_records(records) if _record_exists(record)]
+
+
+def _format_record_label(record: dict[str, object]) -> str:
+    status = str(record['status'])
+    updated = str(record['updated_at']).replace('T', ' ')
+    if status == 'active' and not _record_exists(record):
+        status = 'missing'
+    return f"{record['display_name']} [{record['file_type']}] - {status} - {updated}"
+
+
+def _owned_draft(user_id: int) -> dict[str, object] | None:
+    draft = st.session_state.draft
+    if not draft:
+        return None
+    if int(draft.get('user_id', -1)) != int(user_id):
+        _clear_draft_state()
+        return None
+    record_id = draft.get('record_id')
+    if not isinstance(record_id, int):
+        _clear_draft_state()
+        return None
+    record = get_file_record(user_id, record_id)
+    if record is None:
+        _clear_draft_state()
+        return None
+    draft['path'] = str(record['storage_path'])
+    draft['output_name'] = str(record['display_name'])
+    draft['file_type'] = str(record['file_type'])
+    return draft
+
+
+def _set_draft_from_record(
+    user_id: int,
+    record: dict[str, object],
+    *,
+    style: str = '',
+    format_options: dict[str, object] | None = None,
+    detail_items: list[tuple[str, str]] | None = None,
+    chart_type: str = '',
+) -> None:
+    st.session_state.draft = {
+        'user_id': int(user_id),
+        'record_id': int(record['id']),
+        'path': str(record['storage_path']),
+        'file_type': str(record['file_type']),
+        'output_name': str(record['display_name']),
+        'style': style,
+        'format_options': format_options or {},
+        'detail_items': detail_items or [],
+        'chart_type': chart_type,
+    }
+
+
+def _resolve_owned_result_path(user_id: int, requested_path: Path, result: str) -> tuple[Path | None, str]:
+    candidate = Path(str(result).strip()) if isinstance(result, str) and str(result).strip() else requested_path
+    final_path = candidate if candidate.exists() else requested_path
+    final_path = final_path.resolve()
+    if not is_user_storage_path(user_id, final_path):
+        return None, 'Generated file escaped the signed-in user workspace.'
+    return final_path, ''
+
+
 def _apply_feedback_to_draft(
+    user_id: int,
     feedback: str,
     style: str,
     format_options: dict[str, object],
     detail_items: list[tuple[str, str]],
 ) -> tuple[bool, str]:
-    draft = st.session_state.draft
+    draft = _owned_draft(user_id)
     if not draft:
         return False, 'No draft available yet.'
-    path = Path(draft['path'])
+
+    record = get_file_record(user_id, int(draft['record_id']))
+    if record is None:
+        return False, 'Draft record not found for the signed-in user.'
+
+    path = Path(str(record['storage_path']))
     if not path.exists():
         return False, 'Draft file not found. Generate a preview again.'
 
-    file_type = draft['file_type']
+    file_type = str(record['file_type'])
     ext = path.suffix.lower().lstrip('.')
 
     if file_type == 'image' or ext in IMAGE_EXTENSIONS:
         result = agent(feedback, str(path), 'A')
-        return (not _is_error_text(result), str(result))
+        if _is_error_text(result):
+            return False, str(result)
+        final_path, path_error = _resolve_owned_result_path(user_id, path, str(result))
+        if path_error or final_path is None or not final_path.exists():
+            return False, path_error or 'Image update did not produce a file in your workspace.'
+        update_file_record(user_id, int(record['id']), storage_path=final_path)
+        draft['path'] = str(final_path)
+        return True, str(result)
 
     if file_type == 'chart':
-        chart_type, chart_data_raw, err = _parse_chart_feedback(feedback, draft.get('chart_type', ''))
+        chart_type, chart_data_raw, err = _parse_chart_feedback(feedback, str(draft.get('chart_type', '')))
         if err:
             return False, err
         chart_data, parse_error = parse_chart_data(chart_data_raw)
         if parse_error:
             return False, parse_error
         result = agent('', str(path), 'W', chart_type=chart_type, chart_data=chart_data)
-        if not _is_error_text(result):
-            draft['chart_type'] = chart_type
-        return (not _is_error_text(result), str(result))
+        if _is_error_text(result):
+            return False, str(result)
+        final_path, path_error = _resolve_owned_result_path(user_id, path, str(result))
+        if path_error or final_path is None or not final_path.exists():
+            return False, path_error or 'Chart update did not produce a file in your workspace.'
+        updated = update_file_record(user_id, int(record['id']), storage_path=final_path)
+        if updated is None:
+            return False, 'Unable to update draft history.'
+        draft['chart_type'] = chart_type
+        draft['path'] = str(final_path)
+        return True, str(result)
 
     if file_type in ('audio', 'video'):
-        return False, 'Feedback-based editing is not supported for audio/video yet. Use a new source path.'
+        return False, 'Feedback-based editing is not supported for audio/video yet. Generate a new file instead.'
 
     current_content = str(agent('', str(path), 'R'))
     lowered_content = current_content.lstrip().lower()
@@ -359,60 +485,132 @@ def _apply_feedback_to_draft(
         format_options=format_options,
         details=detail_items,
     )
-    return (not _is_error_text(result), str(result))
+    if _is_error_text(result):
+        return False, str(result)
+    final_path, path_error = _resolve_owned_result_path(user_id, path, str(result))
+    if path_error or final_path is None or not final_path.exists():
+        return False, path_error or 'Updated content did not produce a file in your workspace.'
+    updated = update_file_record(user_id, int(record['id']), storage_path=final_path)
+    if updated is None:
+        return False, 'Unable to update draft history.'
+    draft['path'] = str(final_path)
+    return True, str(result)
 
 
-def _is_error_text(value: object) -> bool:
-    if not isinstance(value, str):
-        return False
-    lowered = value.lower()
-    return (
-        lowered.startswith('error')
-        or lowered.startswith('[ai unavailable')
-        or 'ai unavailable' in lowered
-        or 'missing dependency' in lowered
-        or 'unsupported file type' in lowered
-        or 'invalid action' in lowered
-        or 'not found' in lowered
-        or 'ai returned empty content' in lowered
+def _render_auth_screen() -> None:
+    st.title('File Generator')
+    st.caption(
+        'Sign in to use a private workspace. Generated files are stored per account, and only that account can '
+        'preview or download them.'
     )
 
+    login_tab, register_tab = st.tabs(['Sign In', 'Create Account'])
 
-def _render_sidebar_help() -> None:
-    draft = st.session_state.draft
-    st.sidebar.header('Navigation')
-    st.sidebar.markdown('1. Create a draft preview')
-    st.sidebar.markdown('2. Review the preview')
-    st.sidebar.markdown('3. Request changes')
-    st.sidebar.markdown('4. Save only when satisfied')
-    if draft and Path(draft['path']).exists():
+    with login_tab:
+        with st.form('login_form'):
+            username = st.text_input('Username', placeholder='yourname')
+            password = st.text_input('Password', type='password')
+            submitted = st.form_submit_button('Sign In', use_container_width=True)
+        if submitted:
+            user, error = authenticate_user(username, password)
+            if error:
+                st.error(error)
+            else:
+                st.session_state.auth_user = user
+                _clear_draft_state()
+                st.rerun()
+
+    with register_tab:
+        with st.form('register_form'):
+            username = st.text_input('New username', placeholder='yourname')
+            password = st.text_input('New password', type='password')
+            confirm = st.text_input('Confirm password', type='password')
+            submitted = st.form_submit_button('Create Account', use_container_width=True)
+        if submitted:
+            if password != confirm:
+                st.error('Passwords do not match.')
+            else:
+                user, error = create_user(username, password)
+                if error:
+                    st.error(error)
+                else:
+                    st.session_state.auth_user = user
+                    _clear_draft_state()
+                    st.success('Account created.')
+                    st.rerun()
+
+
+def _render_sidebar(user: dict[str, object], records: list[dict[str, object]]) -> None:
+    draft = _owned_draft(int(user['id']))
+    active_count = len(_existing_active_records(records))
+    st.sidebar.header('Account')
+    st.sidebar.caption(f"Signed in as `{user['username']}`")
+    st.sidebar.caption(f'{active_count} file(s) in your history')
+
+    if st.sidebar.button('Log Out', use_container_width=True):
+        _clear_user_session()
+        st.rerun()
+
+    if st.sidebar.button('Clear Current Draft', use_container_width=True):
+        _clear_draft_state()
+        st.rerun()
+
+    st.sidebar.header('Workspace')
+    st.sidebar.markdown('1. Generate into your private storage')
+    st.sidebar.markdown('2. Refine the current draft')
+    st.sidebar.markdown('3. Reopen any file from My Files')
+    st.sidebar.markdown('4. Read or delete only owned files')
+    if draft and Path(str(draft['path'])).exists():
         st.sidebar.success('Draft ready')
-        st.sidebar.caption(f"`{Path(draft['path']).name}`")
+        st.sidebar.caption(f"`{draft['output_name']}`")
     else:
-        st.sidebar.caption('No draft generated yet.')
+        st.sidebar.caption('No active draft selected.')
     with st.sidebar.expander('Input Examples', expanded=False):
         st.markdown('Chart: `line|Jan:10,Feb:20,Mar:15`')
         st.markdown('Table detail: `tables: Name|Q1|Q2`')
         st.markdown('Hyperlink detail: `hyperlinks: Example Site|https://example.com`')
 
 
-def build_ui() -> None:
-    _init_state()
-    st.set_page_config(page_title='File Generator UI', page_icon='📄', layout='wide')
-    st.title('File Generator')
-    st.caption('Create a draft, review it, request changes, and save only when you are satisfied.')
-    _render_sidebar_help()
-    if st.sidebar.button('Clear Draft'):
-        st.session_state.draft = None
-        st.session_state.feedback_text = ''
-        st.session_state.feedback_history = []
-        st.rerun()
+def _history_rows(records: list[dict[str, object]]) -> list[dict[str, str]]:
+    rows: list[dict[str, str]] = []
+    for record in records:
+        status = str(record['status'])
+        if status == 'active' and not _record_exists(record):
+            status = 'missing'
+        rows.append(
+            {
+                'File': str(record['display_name']),
+                'Type': str(record['file_type']),
+                'Status': status,
+                'Updated (UTC)': str(record['updated_at']).replace('T', ' '),
+            }
+        )
+    return rows
 
-    create_tab, manage_tab = st.tabs(['Create / Refine / Save', 'Read / Delete'])
+
+def build_ui() -> None:
+    st.set_page_config(page_title='File Generator UI', page_icon='📄', layout='wide')
+    _init_state()
+
+    user = st.session_state.auth_user
+    if not user:
+        _render_auth_screen()
+        return
+
+    user_id = int(user['id'])
+    records = list_file_records(user_id, include_deleted=True)
+    active_records = _existing_active_records(records)
+    draft = _owned_draft(user_id)
+
+    st.title('File Generator')
+    st.caption('Authenticated mode: every generated file is saved into the signed-in user workspace and tracked in history.')
+    _render_sidebar(user, records)
+
+    create_tab, history_tab, manage_tab = st.tabs(['Create / Refine', 'My Files', 'Read / Delete'])
 
     with create_tab:
-        st.info('Follow the guided flow: choose what to make, add content, tweak the look, preview, then refine.')
-        st.markdown('**Workflow:** Create -> Preview -> Request changes -> Save when happy.')
+        st.info('Create or refine files inside your own private workspace. File paths are no longer shared across users.')
+        st.markdown('**Workflow:** Generate -> Review -> Request changes -> Download from your own history.')
         input_col, config_col = st.columns([1.3, 1.0])
 
         with input_col:
@@ -421,7 +619,7 @@ def build_ui() -> None:
                 'Draft mode',
                 options=list(CREATE_ACTION_LABELS.keys()),
                 horizontal=True,
-                help='Write = start fresh. Append = continue an existing draft.',
+                help='Write = create a new private file. Append = continue an owned file.',
             )
             create_action = CREATE_ACTION_LABELS[create_action_label]
             file_type = st.selectbox(
@@ -430,20 +628,39 @@ def build_ui() -> None:
                 help='Pick the output type first so we can tailor guidance.',
             )
             st.caption(f'Hint: {FILE_TYPE_HINTS.get(file_type, "Describe what you want and any must-have sections.")}')
-            output_name = resolve_file_name(
-                st.text_input('Save name (no extension needed)', value='output'),
+
+            default_name = draft['output_name'] if draft and draft['file_type'] == file_type else 'output'
+            requested_name = resolve_file_name(
+                st.text_input('Save name', value=default_name),
                 file_type,
             )
+            output_name = sanitize_file_name(requested_name, f'output.{DEFAULT_EXT_BY_TYPE[file_type]}')
+
+            append_options = [
+                record for record in active_records
+                if str(record['file_type']) == file_type
+            ]
+            current_draft_available = bool(draft and draft['file_type'] == file_type and Path(str(draft['path'])).exists())
+            append_choices: list[str] = ['']
+            if current_draft_available:
+                append_choices.append('__current__')
+            append_choices.extend(str(record['id']) for record in append_options)
             append_target = ''
             if create_action == 'A':
-                suggested_append = ''
-                if st.session_state.draft and Path(st.session_state.draft['path']).exists():
-                    suggested_append = st.session_state.draft['path']
-                append_target = st.text_input(
-                    'Append to existing file (optional)',
-                    value=suggested_append,
-                    help='Leave blank to append to the current draft. Provide a path/name to target another file.',
+                append_target = st.selectbox(
+                    'Append to',
+                    options=append_choices,
+                    format_func=lambda value: (
+                        'Create a new private file'
+                        if value == ''
+                        else 'Current draft'
+                        if value == '__current__'
+                        else _format_record_label(next(record for record in append_options if str(record['id']) == value))
+                    ),
+                    help='Only files in your account history are available here.',
                 )
+                if append_target not in {'', '__current__'}:
+                    st.caption('Append keeps the selected file name and ownership.')
 
             st.markdown('### Step 2: Content & Data')
             content = st.text_area(
@@ -477,8 +694,8 @@ def build_ui() -> None:
             st.caption('Leave blank to use the default style for the chosen file type.')
 
             with st.expander('Formatting (font, color, size, alignment)', expanded=False):
-                font = st.text_input('Font family', value='', placeholder='Inter, Georgia, Consolas...')
-                color = st.text_input('Primary color', value='', placeholder='e.g., #0F766E or "indigo 600"')
+                font = st.text_input('Font family', value='', placeholder='Georgia, Consolas...')
+                color = st.text_input('Primary color', value='', placeholder='e.g., #0F766E or "teal 700"')
                 size = st.number_input('Base size', min_value=0.0, max_value=120.0, step=1.0, value=0.0)
                 alignment = st.selectbox('Alignment', ['', 'left', 'center', 'right', 'justify'])
                 styles_raw = st.text_input('Styles (comma-separated)', value='', placeholder='bold, italic, underline')
@@ -502,7 +719,7 @@ def build_ui() -> None:
             content=content,
             chart_type=chart_type,
             chart_data_raw=chart_data_raw,
-            append_target=append_target,
+            has_append_target=append_target in {'__current__'} or bool(append_target),
         )
 
         button_col1, button_col2, status_col = st.columns([0.9, 0.9, 1.2])
@@ -511,7 +728,7 @@ def build_ui() -> None:
         with button_col2:
             reset_clicked = st.button('Reset Inputs', use_container_width=True)
         with status_col:
-            _show_step_feedback(errors, warnings, 'Ready: click "Generate Preview" to create a draft.')
+            _show_step_feedback(errors, warnings, 'Ready: generate a preview into your private history.')
 
         if reset_clicked:
             st.session_state.feedback_text = ''
@@ -522,24 +739,21 @@ def build_ui() -> None:
             if errors:
                 st.error('Cannot generate until the required fixes above are addressed.')
             else:
+                existing_record: dict[str, object] | None = None
                 if create_action == 'A':
-                    if append_target.strip():
-                        target = append_target.strip()
-                        draft_path = resolve_file_name(target, file_type) if '.' not in Path(target).name else target
-                        if not Path(draft_path).exists():
-                            st.info('Append target not found; creating a new draft instead.')
-                            draft_path = _new_draft_path(file_type)
-                    elif st.session_state.draft and Path(st.session_state.draft['path']).exists():
-                        draft_path = st.session_state.draft['path']
-                    else:
-                        draft_path = _new_draft_path(file_type)
-                        st.info('No existing draft selected. Appending to a new draft file.')
-                else:
-                    draft_path = _new_draft_path(file_type)
+                    if append_target == '__current__' and draft:
+                        existing_record = get_file_record(user_id, int(draft['record_id']))
+                    elif append_target:
+                        existing_record = get_file_record(user_id, int(append_target))
 
+                target_path = (
+                    Path(str(existing_record['storage_path']))
+                    if existing_record is not None
+                    else allocate_storage_path(user_id, output_name)
+                )
                 result = run_action(
                     action=create_action,
-                    file_name=draft_path,
+                    file_name=str(target_path),
                     content=content,
                     chart_type=chart_type if file_type == 'chart' else '',
                     chart_data_raw=chart_data_raw,
@@ -548,39 +762,79 @@ def build_ui() -> None:
                     detail_items=detail_items,
                 )
                 if _is_error_text(result):
+                    if existing_record is None and target_path.exists():
+                        try:
+                            target_path.unlink()
+                        except Exception:
+                            pass
                     st.error(result)
                 else:
-                    final_path = Path(result) if Path(str(result)).exists() else Path(draft_path)
-                    st.session_state.draft = {
-                        'path': str(final_path),
-                        'file_type': file_type,
-                        'output_name': output_name,
-                        'style': style.strip(),
-                        'format_options': format_options,
-                        'detail_items': detail_items,
-                        'chart_type': chart_type,
-                    }
-                    st.session_state.feedback_history = []
-                    st.success('Preview generated. Review and refine below.')
+                    final_path, path_error = _resolve_owned_result_path(user_id, target_path, result)
+                    if path_error or final_path is None or not final_path.exists():
+                        if existing_record is None and target_path.exists():
+                            try:
+                                target_path.unlink()
+                            except Exception:
+                                pass
+                        st.error(path_error or 'Generation finished without creating a file in your workspace.')
+                    else:
+                        if existing_record is None:
+                            record = create_file_record(
+                                user_id,
+                                output_name,
+                                file_type,
+                                final_path,
+                            )
+                        else:
+                            record = update_file_record(
+                                user_id,
+                                int(existing_record['id']),
+                                storage_path=final_path,
+                            )
+                            if record is None:
+                                st.error('Unable to update file history.')
+                                record = None
 
-        draft = st.session_state.draft
-        if draft and Path(draft['path']).exists():
+                        if record is not None:
+                            _set_draft_from_record(
+                                user_id,
+                                record,
+                                style=style.strip(),
+                                format_options=format_options,
+                                detail_items=detail_items,
+                                chart_type=chart_type,
+                            )
+                            st.session_state.feedback_history = []
+                            st.success('Preview generated and stored in your private history.')
+                            st.rerun()
+
+        draft = _owned_draft(user_id)
+        if draft:
+            draft_record = get_file_record(user_id, int(draft['record_id']))
+        else:
+            draft_record = None
+        if draft_record and Path(str(draft_record['storage_path'])).exists():
             st.markdown('---')
             preview_col, review_col = st.columns([1.45, 1.0])
 
             with preview_col:
-                _render_preview(Path(draft['path']), draft['file_type'])
+                _render_preview(
+                    Path(str(draft_record['storage_path'])),
+                    str(draft_record['file_type']),
+                    str(draft_record['display_name']),
+                )
 
             with review_col:
-                st.subheader('Finalize')
+                st.subheader('Download')
+                st.caption('This download is restricted to the currently signed-in user file.')
                 try:
-                    draft_path = Path(draft['path'])
+                    draft_path = Path(str(draft_record['storage_path']))
                     draft_bytes = draft_path.read_bytes()
                     mime = _guess_mime(draft_path)
                     st.download_button(
-                        'Save This File',
+                        'Download Current File',
                         data=draft_bytes,
-                        file_name=draft.get('output_name', draft_path.name),
+                        file_name=str(draft_record['display_name']),
                         mime=mime,
                         use_container_width=True,
                     )
@@ -588,17 +842,18 @@ def build_ui() -> None:
                     st.error(f'Unable to prepare download: {exc}')
 
                 st.subheader('Request Changes')
-                st.caption('Describe what to change, then apply. You can repeat until satisfied.')
+                st.caption('Describe what to change, then apply. Updates stay on your copy only.')
                 feedback = st.text_area('Change Instructions', key='feedback_text', height=130)
                 if st.button('Apply Changes with AI', use_container_width=True):
                     if not feedback.strip():
                         st.warning('Enter change instructions first.')
                     else:
                         success, message = _apply_feedback_to_draft(
+                            user_id=user_id,
                             feedback=feedback.strip(),
-                            style=draft.get('style', ''),
-                            format_options=draft.get('format_options', {}),
-                            detail_items=draft.get('detail_items', []),
+                            style=str(draft.get('style', '')),
+                            format_options=dict(draft.get('format_options', {})),
+                            detail_items=list(draft.get('detail_items', [])),
                         )
                         st.session_state.feedback_history.append(feedback.strip())
                         if success:
@@ -613,59 +868,126 @@ def build_ui() -> None:
                     for idx, item in enumerate(st.session_state.feedback_history, start=1):
                         st.write(f'{idx}. {item}')
 
+    with history_tab:
+        st.info('History is account-scoped. Only files recorded for the signed-in user can be previewed or downloaded here.')
+        if not records:
+            st.caption('No files in your history yet.')
+        else:
+            st.dataframe(_history_rows(records), hide_index=True, use_container_width=True)
+
+        previewable_records = _existing_active_records(records)
+        if previewable_records:
+            selected_history_id = st.selectbox(
+                'Select a file from your history',
+                options=[''] + [str(record['id']) for record in previewable_records],
+                format_func=lambda value: (
+                    'Choose a file'
+                    if value == ''
+                    else _format_record_label(next(record for record in previewable_records if str(record['id']) == value))
+                ),
+            )
+            if selected_history_id:
+                selected_record = get_file_record(user_id, int(selected_history_id))
+                if selected_record and Path(str(selected_record['storage_path'])).exists():
+                    preview_col, info_col = st.columns([1.45, 1.0])
+                    with preview_col:
+                        _render_preview(
+                            Path(str(selected_record['storage_path'])),
+                            str(selected_record['file_type']),
+                            str(selected_record['display_name']),
+                        )
+                    with info_col:
+                        st.subheader('Owned File')
+                        st.caption(f"Created: {selected_record['created_at']}")
+                        st.caption(f"Updated: {selected_record['updated_at']}")
+                        download_path = Path(str(selected_record['storage_path']))
+                        try:
+                            st.download_button(
+                                'Download From History',
+                                data=download_path.read_bytes(),
+                                file_name=str(selected_record['display_name']),
+                                mime=_guess_mime(download_path),
+                                use_container_width=True,
+                            )
+                        except Exception as exc:
+                            st.error(f'Unable to prepare download: {exc}')
+                        if st.button('Open As Current Draft', use_container_width=True):
+                            _set_draft_from_record(user_id, selected_record)
+                            st.success('Loaded into the editor.')
+                            st.rerun()
+        else:
+            st.caption('No active files are currently available for preview.')
+
     with manage_tab:
-        st.info('Use this tab for quick reads or deletes without the draft workflow.')
-        st.markdown('**Tip:** Add a short focus instruction for reads (e.g., "summarize section 2"). Leave delete target empty to remove the whole file.')
-        manage_col1, manage_col2 = st.columns([1.2, 1.0])
+        st.info('Read and delete are now ownership-checked. You can only target files from your own history.')
+        manageable_records = _existing_active_records(records)
+        if not manageable_records:
+            st.caption('No active owned files available.')
+        else:
+            manage_col1, manage_col2 = st.columns([1.2, 1.0])
+            current_draft_id = str(draft['record_id']) if draft else ''
 
-        with manage_col1:
-            manage_action_label = st.radio(
-                'Operation',
-                options=list(READ_DELETE_ACTION_LABELS.keys()),
-                horizontal=True,
-                help='Read shows file content (with optional focus). Delete removes content or the whole file.',
-            )
-            manage_action = READ_DELETE_ACTION_LABELS[manage_action_label]
-            manage_file_type = st.selectbox('File Type', SUPPORTED_FILE_TYPES, key='manage_file_type')
-            manage_file_name = resolve_file_name(
-                st.text_input('Target file name or path', value='output', key='manage_output_name'),
-                manage_file_type,
-            )
-            st.caption(f'Will target `{manage_file_name}` relative to the current working directory.')
-            manage_content = st.text_area(
-                'Read focus or delete target (optional)',
-                height=180,
-                placeholder='Read: "summarize takeaways" or "extract tables". Delete: "table 2" or leave blank to delete file.',
-            )
-            if manage_action == 'D' and not manage_content.strip():
-                st.warning('Delete target is empty. Running delete will remove the entire file.')
+            with manage_col1:
+                manage_action_label = st.radio(
+                    'Operation',
+                    options=list(READ_DELETE_ACTION_LABELS.keys()),
+                    horizontal=True,
+                    help='Read shows file content or a summary. Delete removes content or the full owned file.',
+                )
+                manage_action = READ_DELETE_ACTION_LABELS[manage_action_label]
+                manage_file_id = st.selectbox(
+                    'Owned file',
+                    options=[str(record['id']) for record in manageable_records],
+                    index=next(
+                        (idx for idx, record in enumerate(manageable_records) if str(record['id']) == current_draft_id),
+                        0,
+                    ),
+                    format_func=lambda value: _format_record_label(
+                        next(record for record in manageable_records if str(record['id']) == value)
+                    ),
+                )
+                manage_content = st.text_area(
+                    'Read focus or delete target (optional)',
+                    height=180,
+                    placeholder='Read: "summarize takeaways" or "extract tables". Delete: "table 2" or leave blank to delete file.',
+                )
+                if manage_action == 'D' and not manage_content.strip():
+                    st.warning('Delete target is empty. Running delete will remove the entire owned file.')
 
-        with manage_col2:
-            st.subheader('Run')
-            st.caption('This executes immediately - no preview draft.')
-            if st.button('Run Action', type='primary', use_container_width=True):
-                if manage_action == 'R' and not Path(manage_file_name).exists():
-                    st.error('File not found. Check the name or provide a full path.')
-                elif manage_action == 'D' and not Path(manage_file_name).exists():
-                    st.error('File not found. Nothing to delete.')
-                else:
-                    result = run_action(
-                        action=manage_action,
-                        file_name=manage_file_name,
-                        content=manage_content,
-                        chart_type='',
-                        chart_data_raw='',
-                        style='',
-                        format_options={},
-                        detail_items=[],
-                    )
-                    if _is_error_text(result):
-                        st.error(result)
+            with manage_col2:
+                st.subheader('Run')
+                st.caption('This executes immediately, but still only on your own file.')
+                if st.button('Run Action', type='primary', use_container_width=True):
+                    record = get_file_record(user_id, int(manage_file_id))
+                    if record is None:
+                        st.error('Selected file is no longer available for this account.')
                     else:
-                        st.success('Completed')
-                        st.text_area('Result', value=str(result), height=240, disabled=True)
-                        if Path(manage_file_name).exists():
-                            st.caption(f'File: `{Path(manage_file_name).resolve()}`')
+                        path = Path(str(record['storage_path']))
+                        if not path.exists():
+                            st.error('File not found on disk for this history record.')
+                        else:
+                            result = run_action(
+                                action=manage_action,
+                                file_name=str(path),
+                                content=manage_content,
+                                chart_type='',
+                                chart_data_raw='',
+                                style='',
+                                format_options={},
+                                detail_items=[],
+                            )
+                            if _is_error_text(result):
+                                st.error(result)
+                            else:
+                                if manage_action == 'D' and _is_full_delete_request(manage_content):
+                                    mark_file_deleted(user_id, int(record['id']))
+                                    if draft and int(draft['record_id']) == int(record['id']):
+                                        _clear_draft_state()
+                                    st.success('Completed and removed the file from your active workspace.')
+                                else:
+                                    update_file_record(user_id, int(record['id']), storage_path=path)
+                                    st.success('Completed')
+                                st.text_area('Result', value=str(result), height=240, disabled=True)
 
 
 if __name__ == '__main__':
