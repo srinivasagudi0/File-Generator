@@ -632,6 +632,8 @@ def _apply_txt_alignment(text: str, alignment: str, width: int | None = None) ->
     mode = str(alignment or '').strip().lower()
     if mode not in ALLOWED_ALIGNMENTS:
         return text
+    if mode == 'left':
+        return text
 
     lines = text.splitlines()
     if width is None:
@@ -1669,8 +1671,8 @@ def _parse_docx_blocks(text: str) -> list[dict[str, object]]:
 
 def _flush_paragraph_buffer(paragraph_buffer: list[str], blocks: list[dict[str, object]]) -> None:
     for line in paragraph_buffer:
-        value = line.strip()
-        if value:
+        if line.strip():
+            value = line
             blocks.append({'type': 'paragraph', 'value': value})
             logger.debug('Buffered paragraph added | preview=%s', preview_text(value))
     paragraph_buffer.clear()
