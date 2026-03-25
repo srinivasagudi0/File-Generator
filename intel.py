@@ -52,6 +52,25 @@ SUPPORTED_AI_PROVIDERS = {'openai', 'hackclub'}
 SUPPORTED_AI_PROVIDER_ALIASES = {'hackvcl': 'hackclub'}
 
 
+def _extract_text_content(value: object) -> str:
+    if value is None:
+        return ''
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        for key in ('text', 'content', 'value'):
+            candidate = value.get(key)
+            if isinstance(candidate, str):
+                return candidate
+        parts_value = value.get('parts')
+        if isinstance(parts_value, (list, tuple)):
+            return ''.join(_extract_text_content(part) for part in parts_value)
+        return ''
+    if isinstance(value, (list, tuple)):
+        return ''.join(_extract_text_content(item) for item in value)
+    return str(value)
+
+
 def _strip_wrapped_quotes(value: str) -> str:
     if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
         return value[1:-1]
@@ -313,7 +332,7 @@ def _hackclub_rest_chat_completion(
     if not choices:
         return ''
     message = choices[0].get('message') or {}
-    return str(message.get('content') or '')
+    return _extract_text_content(message.get('content'))
 
 
 def _requests_empty_content(user_input: str) -> bool:
@@ -447,8 +466,8 @@ def stage1(user_input: str, action:str, name: str) -> str:
                     max_tokens=1200,
                     temperature=0.7,
                 )
-                output = response.choices[0].message.content
-                if output and str(output).strip():
+                output = _extract_text_content(response.choices[0].message.content)
+                if output and output.strip():
                     logger.info(
                         'AI completion succeeded | provider=%s model=%s action=%s file=%s output_len=%d output_preview=%s',
                         ai_settings.get('provider'),
@@ -884,13 +903,13 @@ def image_reading(path: str, user_request: str = '') -> str:
     def extract_response_text(resp) -> str:
         out = getattr(resp, "output_text", None)
         if out:
-            return out.strip()
+            return out
         parts = []
         for item in getattr(resp, "output", []) or []:
             for c in item.get("content", []) or []:
                 if c.get("type") == "output_text":
                     parts.append(c.get("text", ""))
-        return ("\n".join(parts) or str(resp)).strip()
+        return "\n".join(parts) or str(resp)
 
     def summarize_text(text: str, client: OpenAI, model: str) -> str:
         focus = user_request.strip()
