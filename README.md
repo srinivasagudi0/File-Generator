@@ -1,24 +1,45 @@
-# File Generator
+# 📁 File Generator
 
-File Generator is a Python app that can create, append, read, and delete content across multiple file types (text, docs, spreadsheets, images, charts, PDF, PPTX, audio/video file stubs).  
-It includes:
+File Generator is a Python app that helps you **create and manage different types of files easily**.
+It works through both CLI and a Streamlit UI.
 
-- CLI workflow (`main.py`)
-- Streamlit UI workflow (`app_ui.py`)
-- AI-assisted content generation and summarization (OpenAI by default, HackClub optional, configured via `.env`)
+---
 
-## Supported File Types
+## 🧠 What It Does
 
-- `txt`, `docx`, `xlsx`, `csv`, `pdf`, `pptx`
-- `markdown`, `html`, `code`
-- `image`, `chart`, `audio`, `video`
+- Create files (text, docs, spreadsheets, etc.)
+- Read and edit existing files
+- Delete files when not needed
+- Use AI to generate or summarize content (optional)
 
-## Requirements
+---
+
+## ⚙️ Features
+
+- 🖥️ CLI workflow (`main.py`)
+- 🌐 Streamlit UI (`app_ui.py`)
+- 🤖 AI support (OpenAI default, HackClub optional)
+- 📂 Multi-file support (docs, images, charts, etc.)
+
+---
+
+## 📦 Supported File Types
+
+- Text & docs → `txt`, `docx`, `pdf`, `markdown`
+- Data → `xlsx`, `csv`
+- Code → `html`, `code`
+- Media → `image`, `chart`, `audio`, `video`
+
+---
+
+## 🧪 Requirements
 
 - Python 3.10+
-- Optional system binary for OCR: `tesseract` (used with `pytesseract`)
+- Optional: `tesseract` (for OCR features)
 
-## Setup
+---
+
+## ⚡ Setup
 
 ```bash
 python -m venv .venv
@@ -27,24 +48,28 @@ pip install -r requirements.txt
 cp .env.example .env
 ```
 
-Set your API config in `.env` before running.
+---
 
-OpenAI (default / easiest setup):
+## 🔐 Configuration
+
+Default (OpenAI):
 
 ```env
 FILEGEN_AI_PROVIDER=openai
-OPENAI_API_KEY=your-openai-api-key
+OPENAI_API_KEY=your-api-key
 ```
 
-Optional HackClub configuration:
+Optional (HackClub):
 
 ```env
 FILEGEN_AI_PROVIDER=hackclub
-HACKCLUB_API_KEY=your-hackclub-api-key
+HACKCLUB_API_KEY=your-key
 HACKCLUB_BASE_URL=https://ai.hackclub.com/proxy/v1
 ```
 
-## Run
+---
+
+## ▶️ Run
 
 CLI:
 
@@ -52,38 +77,37 @@ CLI:
 python main.py
 ```
 
-Streamlit UI:
+UI:
 
 ```bash
 streamlit run app_ui.py
 ```
 
-## Local Accounts in Streamlit
+---
 
-The Streamlit UI now requires a local account before you can generate, preview, read, or download files.
+## 👤 User System (Streamlit)
 
-- Accounts are stored in a local SQLite database under `.filegen_data/`
-- Passwords are stored as salted PBKDF2 hashes
-- Generated files are written into per-user storage folders under `.filegen_data/users/<user_id>/files/`
-- The UI only shows history entries that belong to the signed-in user
-- Read, append, preview, download, and delete actions are limited to the current user's files
+- Requires login before using features
+- Data stored locally using SQLite
+- Passwords are securely hashed
+- Each user has their own file storage
+- You can only access your own files
 
-The CLI workflow in `main.py` remains a direct local workflow and does not enforce the Streamlit account system.
+---
 
-## Security Notes
+## 🔒 Security
 
-- Do not commit `.env` or real API keys.
-- This repository is configured to ignore generated files and local runtime artifacts, including `.filegen_data/`.
+- Do NOT upload `.env` or API keys
+- Generated files are ignored by Git
+- Local data is stored in `.filegen_data/`
 
-## Publish to GitHub
+---
 
-Run these commands from this project folder:
+## 🏁 Final
 
-```bash
-git init
-git add .
-git commit -m "Initial commit"
-git branch -M main
-git remote add origin <your-github-repo-url>
-git push -u origin main
-```
+Simple tool.
+
+Does the job.
+
+More features coming.
+
